@@ -1,0 +1,13 @@
+# Include all production requirements
+-r requirements.txt
+
+# Additional development tools
+ipython==8.17.2
+jupyter==1.0.0
+
+# Performance testing
+locust==2.17.0
+
+# Documentation
+mkdocs==1.5.3
+mkdocs-material==9.4.8

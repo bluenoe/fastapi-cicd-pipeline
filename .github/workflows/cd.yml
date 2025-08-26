@@ -1,0 +1,201 @@
+name: CD Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  DOCKER_IMAGE: ${{ secrets.DOCKER_USERNAME }}/fastapi-cicd
+
+jobs:
+  # Deploy to Staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging'
+    environment:
+      name: staging
+      url: https://staging.fastapi-cicd.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            cd /opt/fastapi-cicd
+            git pull origin main
+            
+            # Export environment variables
+            export DOCKER_IMAGE=${{ env.DOCKER_IMAGE }}
+            export IMAGE_TAG=latest
+            export POSTGRES_USER=${{ secrets.POSTGRES_USER }}
+            export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            export POSTGRES_DB=${{ secrets.POSTGRES_DB }}
+            export SECRET_KEY=${{ secrets.SECRET_KEY }}
+            
+            # Zero-downtime deployment
+            docker-compose -f docker-compose.prod.yml pull
+            docker-compose -f docker-compose.prod.yml up -d --no-deps app
+            
+            # Health check
+            sleep 30
+            curl -f http://localhost:8000/healthz || exit 1
+            
+            echo "Staging deployment completed successfully"
+
+  # Deploy to Production
+  deploy-production:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    environment:
+      name: production
+      url: https://fastapi-cicd.com
+    needs: []
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "version=latest" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy to production
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.PRODUCTION_HOST }}
+          username: ${{ secrets.PRODUCTION_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_KEY }}
+          script: |
+            cd /opt/fastapi-cicd
+            
+            # Backup current deployment
+            docker-compose -f docker-compose.prod.yml exec -T db pg_dump -U ${{ secrets.POSTGRES_USER }} ${{ secrets.POSTGRES_DB }} > backup_$(date +%Y%m%d_%H%M%S).sql
+            
+            # Pull latest code and images
+            git fetch --tags
+            git checkout ${{ steps.version.outputs.version }}
+            
+            # Export environment variables
+            export DOCKER_IMAGE=${{ env.DOCKER_IMAGE }}
+            export IMAGE_TAG=${{ steps.version.outputs.version }}
+            export POSTGRES_USER=${{ secrets.POSTGRES_USER }}
+            export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            export POSTGRES_DB=${{ secrets.POSTGRES_DB }}
+            export SECRET_KEY=${{ secrets.SECRET_KEY }}
+            
+            # Pull new image
+            docker pull ${{ env.DOCKER_IMAGE }}:${{ steps.version.outputs.version }}
+            
+            # Zero-downtime deployment with rolling update
+            docker-compose -f docker-compose.prod.yml up -d --no-deps app
+            
+            # Wait for health check
+            echo "Waiting for application to be ready..."
+            for i in {1..30}; do
+              if curl -f http://localhost:8000/healthz; then
+                echo "Application is healthy"
+                break
+              fi
+              echo "Attempt $i: Application not ready, waiting..."
+              sleep 10
+            done
+            
+            # Verify deployment
+            if ! curl -f http://localhost:8000/healthz; then
+              echo "Deployment failed - rolling back"
+              docker-compose -f docker-compose.prod.yml down
+              # Add rollback logic here
+              exit 1
+            fi
+            
+            # Clean up old images
+            docker image prune -f
+            
+            echo "Production deployment completed successfully"
+
+      - name: Post-deployment verification
+        run: |
+          # Add any post-deployment checks here
+          echo "Running post-deployment verification..."
+          
+          # Example: Check if all endpoints are responding
+          # curl -f https://fastapi-cicd.com/healthz
+          # curl -f https://fastapi-cicd.com/api/v1/users/
+
+      - name: Notify deployment success
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          message: "✅ Production deployment successful for version ${{ steps.version.outputs.version }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify deployment failure
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          message: "❌ Production deployment failed for version ${{ steps.version.outputs.version }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Rollback functionality
+  rollback-production:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'rollback'
+    environment:
+      name: production
+    steps:
+      - name: Rollback production deployment
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.PRODUCTION_HOST }}
+          username: ${{ secrets.PRODUCTION_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_KEY }}
+          script: |
+            cd /opt/fastapi-cicd
+            
+            # Get previous successful deployment
+            PREVIOUS_TAG=$(git tag --sort=-version:refname | head -n 2 | tail -n 1)
+            
+            echo "Rolling back to version: $PREVIOUS_TAG"
+            
+            git checkout $PREVIOUS_TAG
+            
+            # Export environment variables
+            export DOCKER_IMAGE=${{ env.DOCKER_IMAGE }}
+            export IMAGE_TAG=$PREVIOUS_TAG
+            export POSTGRES_USER=${{ secrets.POSTGRES_USER }}
+            export POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            export POSTGRES_DB=${{ secrets.POSTGRES_DB }}
+            export SECRET_KEY=${{ secrets.SECRET_KEY }}
+            
+            # Deploy previous version
+            docker-compose -f docker-compose.prod.yml up -d --no-deps app
+            
+            # Health check
+            sleep 30
+            curl -f http://localhost:8000/healthz || exit 1
+            
+            echo "Rollback completed successfully to version: $PREVIOUS_TAG"
